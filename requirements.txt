@@ -1,0 +1,7 @@
+# the panel itself (lightweight; the heavy ML deps live in each tool's own env)
+streamlit>=1.46
+pandas
+pyyaml
+altair
+matplotlib   # table colour gradients
+psutil

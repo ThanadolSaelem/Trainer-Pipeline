@@ -1,0 +1,48 @@
+name: example
+notes: ตัวอย่าง experiment แก้ค่าในหน้าเว็บแล้วกดบันทึก
+data:
+  input: data/
+  pattern: '*.jsonl'
+  text_keys: text
+  clean_steps: [html, bbcode, emoji, emoticon, links, social]
+  pdpa_policy: mask
+  pdpa_steps: [name, email, phone, links, card, account, address]
+  keep_last: 4
+  thai_ner_full: false
+  thai_mark_fix: true
+  floating_policy: drop
+  normalize: NFC
+  detect_mixed_script: true
+  mixed_policy: tag
+  flags_key: __flags
+  fasttext_model: model/fasttext.bin
+  workers: 4
+  chunk_size: 2000
+  debug_first_n: 200
+perplexity:
+  model: google/gemma-3-270m
+  context_length: 2048
+  overlap_ratio: 0.25
+  batch_size: 4
+  top_k_tokens: 5
+train:
+  base_model: google/gemma-3-270m
+  input_column: instruction
+  output_column: output
+  prompt_template: "### คำสั่ง:\\n{instruction}\\n\\n### คำตอบ:"
+  adapter: lora
+  lora_r: 8
+  quantization_bits: none
+  epochs: 3
+  learning_rate: 0.0003
+  batch_size: 1
+  gradient_accumulation_steps: 16
+  merge_adapter: true
+eval:
+  model_path: google/gemma-3-270m
+  source: hf
+  mode: pt
+  data: [belebele, xcopa, xnli, thai_exam]
+  num_shots: 5
+  batch_size: 4
+  debug: true
