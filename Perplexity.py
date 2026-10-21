@@ -459,17 +459,31 @@ def looks_like_instruct_model(model_name: str) -> bool:
     return bool(_INSTRUCT_HINT.search(model_name))
 
 
-def _decode_token(tokenizer, tid: int) -> str:
-    try:
-        t = tokenizer.decode([tid], skip_special_tokens=False)
-        if t and "\ufffd" not in t:
-            return t
-    except Exception:
-        pass
-    try:
-        return str(tokenizer.convert_ids_to_tokens(tid))
-    except Exception:
-        return str(tid)
+def _decode_token(tokenizer, ids: List[int], pos: int) -> Tuple[str, str]:
+    """คืน (token, context) ของโทเค็นที่ตำแหน่ง pos ให้อ่านออก
+
+    tokenizer แบบ byte-level มักหั่นอักษรไทย (3 ไบต์) เป็นหลายโทเค็น ถ้าถอดรหัสทีละตัวจะได้ \ufffd
+    จึงลองต่อกับโทเค็นข้างเคียงจนได้ตัวอักษรเต็ม และคืนบริบทสั้น ๆ ไว้ดูว่าสะดุดคำไหน
+    """
+    def dec(a, b, skip_special=False):
+        try:
+            return tokenizer.decode(ids[max(0, a):b], skip_special_tokens=skip_special)
+        except Exception:
+            return ""
+    token = dec(pos, pos + 1)
+    if not token or "\ufffd" in token:
+        for left, right in ((1, 1), (0, 2), (1, 2), (2, 2)):
+            t = dec(pos - left, pos + right).strip("\ufffd")
+            if t:
+                token = t
+                break
+        else:
+            try:
+                token = str(tokenizer.convert_ids_to_tokens(ids[pos]))
+            except Exception:
+                token = str(ids[pos])
+    context = dec(pos - 4, pos + 2, skip_special=True).replace("\n", " ").strip("\ufffd")
+    return token, context
 
 
 # -------------------- Core: compute PPL per line --------------------
@@ -570,7 +584,7 @@ def compute_ppl_per_line(
 
         sum_nll = 0.0
         sum_tokens = 0
-        worst: List[Tuple[float, int]] = []  # (loss, token_id)
+        worst: List[Tuple[float, str, str]] = []  # (loss, token, context)
 
         for chunk_batch in batch_iterator(chunks, batch_size):
             batch_max = max(c["input_ids"].size(1) for c in chunk_batch)
@@ -613,11 +627,15 @@ def compute_ppl_per_line(
 
             if top_k_tokens > 0:
                 flat_loss = masked_loss.view(-1)
-                flat_ids = shift_labels.reshape(-1)
+                seq_len = shift_labels.size(1)
                 k = min(top_k_tokens, int(shift_mask.sum().item()))
                 if k > 0:
                     vals, idxs = torch.topk(flat_loss, k)
-                    worst.extend((float(v), int(flat_ids[i])) for v, i in zip(vals.tolist(), idxs.tolist()))
+                    for v, i in zip(vals.tolist(), idxs.tolist()):
+                        row, col = divmod(i, seq_len)
+                        row_ids = input_ids[row].tolist()
+                        tok, ctx = _decode_token(tokenizer, row_ids, col + 1)  # label at col = input token col+1
+                        worst.append((float(v), tok, ctx))
 
         if sum_tokens > 0:
             ppl = math.exp(sum_nll / sum_tokens)
@@ -629,7 +647,7 @@ def compute_ppl_per_line(
 
         if details_out is not None:
             n_chars = len(clean_texts[line_idx])
-            worst.sort(reverse=True)
+            worst.sort(key=lambda w: w[0], reverse=True)
             details_out.append({
                 "index": line_idx,
                 "ppl": ppl if math.isfinite(ppl) else None,
@@ -639,8 +657,8 @@ def compute_ppl_per_line(
                 # chars ต่อโทเค็นต่ำ = tokenizer แตกคำเยอะ (fertility สูง) มักเจอกับภาษาไทย/คำเฉพาะทาง
                 "chars_per_token": (n_chars / sum_tokens) if sum_tokens else None,
                 "worst_tokens": [
-                    {"token": _decode_token(tokenizer, tid), "loss": round(l, 4)}
-                    for l, tid in worst[:top_k_tokens]
+                    {"token": tok, "context": ctx, "loss": round(l, 4)}
+                    for l, tok, ctx in worst[:top_k_tokens]
                 ],
             })
 
