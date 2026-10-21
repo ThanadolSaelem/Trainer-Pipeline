@@ -4,21 +4,21 @@
 ครอบ repo `data-pipeline` และ `evaluation` เดิมโดยไม่ต้องแก้ core logic ของมัน
 ทุกอย่างรันบนเครื่องคุณ ข้อมูลไม่ออกนอกเครื่อง
 
-## โครงสร้างโฟลเดอร์ที่แนะนำ
+## โครงสร้างโฟลเดอร์
 
 ```
-ainrg-llm-dev/
-├── data-pipeline/      (repo เดิม)
-├── evaluation/         (repo เดิม)
-└── llm-panel/          (โฟลเดอร์นี้)
+Trainer-Pipeline/
+├── data-pipeline/
+├── evaluation/
+└── panel/          (โฟลเดอร์นี้)
 ```
 
-ถ้าวาง repo ไว้ที่อื่น ตั้ง path ได้ที่หน้า **Settings**
+panel หา `../data-pipeline` และ `../evaluation` ให้อัตโนมัติ ถ้าย้ายไปไว้ที่อื่นตั้ง path ได้ที่หน้า **Settings**
 
 ## ติดตั้ง (macOS)
 
 ```bash
-cd llm-panel
+cd panel
 ./run_panel.sh            # ครั้งแรกจะสร้าง .venv และติดตั้ง dependency ของ panel ให้
 ```
 
