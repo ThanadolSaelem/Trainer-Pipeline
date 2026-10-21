@@ -71,13 +71,14 @@ _F_CLEAN_AVAILABLE = False
 _THAI_NER_AVAILABLE = False
 try:
     from src.f_text_cleaner import (
-        remove_html_tags, remove_bbcode_tags, remove_emoticons,
+        remove_html_tags, remove_bbcode_tags, remove_emoticons, remove_emojis,
         remove_emails, remove_web_links, remove_phone_numbers,
         remove_social_media_mentions,
         clean_name, clean_phone, clean_national_id, clean_email,
         anonymize_credit_cards, anonymize_bank_accounts,
         thai_ner_full_apply, _load_thai_ner, address_mask, address_anonymize,
-        reset_romanize_cache, configure_public_figure_paths
+        reset_romanize_cache, configure_public_figure_paths,
+        filter_national_id, reset_person_cache,
     )
     _F_CLEAN_AVAILABLE = True
     _THAI_NER_AVAILABLE = True
@@ -91,6 +92,8 @@ _CLEAN_STEP_FUNCS = {
     "html":     (lambda s: remove_html_tags(s))                if _F_CLEAN_AVAILABLE else (lambda s: s),
     "bbcode":   (lambda s: remove_bbcode_tags(s))              if _F_CLEAN_AVAILABLE else (lambda s: s),
     "emoticon": (lambda s: remove_emoticons(s))                if _F_CLEAN_AVAILABLE else (lambda s: s),
+    # "emoji" อยู่ใน default ของ --clean-steps แต่เดิมไม่ได้ลงทะเบียนไว้ จึงไม่เคยถูกลบจริง
+    "emoji":    (lambda s: remove_emojis(s))                   if _F_CLEAN_AVAILABLE else (lambda s: s),
     "links":    (lambda s: remove_web_links(s))                if _F_CLEAN_AVAILABLE else (lambda s: s),
     "social":   (lambda s: remove_social_media_mentions(s))    if _F_CLEAN_AVAILABLE else (lambda s: s),
 }
@@ -105,6 +108,8 @@ _FTEXT_STEP_FUNCS = {
     "remove_phones":    (lambda s: remove_phone_numbers(s)) if _F_CLEAN_AVAILABLE else (lambda s: s),
     "remove_social":    _CLEAN_STEP_FUNCS["social"],
 }
+
+_WARNED_STEPS: set = set()
 
 # ========= Text key heuristics =========
 _DEFAULT_TEXT_KEYS = [
@@ -334,6 +339,7 @@ def apply_pdpa(text: str, policy: str, steps: List[str], *,
         if "links" in st: text = remove_web_links(text)
         if "card"  in st: text = anonymize_credit_cards(text, mode="mask", keep_last=keep_last)
         if "account" in st: text = anonymize_bank_accounts(text, mode="mask", keep_last=keep_last)
+        if "id_card" in st: text = filter_national_id(text, token="[NATIONAL_ID]")
         if "address" in st: text = address_mask(text, gazetteer_path=addr_gazetteer, tag=addr_tag)
         return text
 
@@ -587,6 +593,11 @@ def process_text(text: str, opt: Options, flags: List[str]) -> str:
     # 1) Sanitizers
     for st in opt.clean_steps:
         fn = _CLEAN_STEP_FUNCS.get(st) or _FTEXT_STEP_FUNCS.get(st)
+        if fn is None:
+            if st not in _WARNED_STEPS:
+                _WARNED_STEPS.add(st)
+                logging.warning(f"[clean-step] unknown step ignored: {st!r} (known: {sorted(_CLEAN_STEP_FUNCS) + sorted(_FTEXT_STEP_FUNCS)})")
+            continue
         if fn:
             try:
                 s0 = fn(s0)
@@ -701,10 +712,15 @@ def iter_files_from_input(input_path: Path, pattern: str = "*.jsonl") -> List[Pa
         return sorted(p for p in input_path.rglob(pattern) if p.is_file())
     return [input_path.resolve()]
 
-def read_lines_in_chunks(path: Path, chunk_size: int):
+def read_lines_in_chunks(path: Path, chunk_size: int, limit: int = 0):
+    """limit > 0 = อ่านแค่ limit บรรทัดแรก (ใช้กับ --debug-first-n)"""
     buf = []
+    n = 0
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
+            if limit and n >= limit:
+                break
+            n += 1
             buf.append(line)
             if len(buf) >= chunk_size:
                 yield buf; buf = []
@@ -799,9 +815,11 @@ def process_chunk(args):
             mixed_hit = False
             if opt.detect_mixed_script and has_mixed_script_adjacent(cleaned):
                 mixed_hit = True
-                flags.append("mixed_adjacent")
+                if opt.mixed_policy == "tag":
+                    flags.append("mixed_adjacent")
+                stats["mixed_adjacent"] += 1
 
-            if opt.debug_first_n and idx < opt.debug_first_n:
+            if opt.debug_show_diff and idx < (opt.debug_first_n or 10):
                 _log_debug_diff(text, cleaned, idx)
 
             out_obj = dict(obj)
@@ -849,6 +867,13 @@ def stream_merge_parts(tmp_dir: Path, fo_Good, fo_Bad):
 
 
 def _write_summary(out_dir: Path, stats: Counter, opt: Options):
+    # summary.json สำหรับเครื่องมืออื่น (เช่น control panel) อ่านต่อ
+    try:
+        with (out_dir / "summary.json").open("w", encoding="utf-8") as fj:
+            json.dump({"stats": dict(stats), "options": {k: v for k, v in opt.__dict__.items()}},
+                      fj, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        logging.warning(f"[summary] cannot write summary.json: {e}")
     summary = out_dir / "summary.txt"
     with summary.open("w", encoding="utf-8") as fo:
         fo.write("# Pipeline Summary\n")
@@ -874,8 +899,14 @@ def _write_summary(out_dir: Path, stats: Counter, opt: Options):
 
 # ========= Per-file runner with checkpoint =========
 
+def _tmp_dir_for(out_dir: Path, input_file: Path, debug_first_n: int) -> Path:
+    # โหมด debug ใช้โฟลเดอร์ชั่วคราวแยก ไม่ให้ done-marker ของรอบทดลองทำให้รอบจริงข้ามข้อมูล
+    suffix = f"_debug{debug_first_n}" if debug_first_n else ""
+    return out_dir / f"tmp_{input_file.stem}{suffix}"
+
+
 def run_one_input_file(input_file: Path, out_dir: Path, args, opt: Options, opt_dict: dict, stats_total: Counter, pool: mp.pool.Pool):
-    tmp_dir = out_dir / f"tmp_{input_file.stem}"
+    tmp_dir = _tmp_dir_for(out_dir, input_file, opt.debug_first_n)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     ckpt = CheckpointManager(tmp_dir)
@@ -887,7 +918,7 @@ def run_one_input_file(input_file: Path, out_dir: Path, args, opt: Options, opt_
     # build chunk jobs
     part_id = 0
     jobs = []
-    for chunk in read_lines_in_chunks(input_file, getattr(args, "chunk_size", 50000)):
+    for chunk in read_lines_in_chunks(input_file, getattr(args, "chunk_size", 50000), opt.debug_first_n):
         done_json  = tmp_dir / f"part_{part_id:08d}.done.json"
         Good_tmp  = tmp_dir / f"part_{part_id:08d}.Good.jsonl"
         Bad_tmp= tmp_dir / f"part_{part_id:08d}.Bad.jsonl"
@@ -994,6 +1025,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4)//2))
     ap.add_argument("--chunk-size", type=int, default=50000)
     ap.add_argument("--single-process", action="store_true", help="Run without multiprocessing (debug/compat)")
+    ap.add_argument("--self-test", action="store_true", help="ทดสอบ NER/ตัวแก้สระลอยกับประโยคตัวอย่างแล้วจบ")
+    ap.add_argument("--doctor", action="store_true", help="ตรวจ environment (bs4, NER, CUDA) แล้วจบ")
 
     # Multi‑GPU (devices auto via CUDA_VISIBLE_DEVICES or torch)
     ap.add_argument("--gpu-workers-per-gpu", type=int, default=1, help="Processes per GPU (each loads the model)")
@@ -1059,6 +1092,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         pubfig_files = _resolve_pubfig_files(args.public_figure_files)
 
+    # เดิมไม่เคยตั้งค่านี้เป็น True ทำให้ NER ไม่ข้ามชื่อบุคคลสาธารณะเลย
+    public_figure_skip = bool(pubfig_files)
     if pubfig_files:
         logging.info("[pubfig] enabled: %d files", len(pubfig_files))
     else:
@@ -1115,7 +1150,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         pull_back_gap=args.pull_back_gap,
         normalize=args.normalize,
         flags_key=(args.flags_key if args.flags_key else None),
+        addr_gazetteer=(str(args.addr_gazetteer) if args.addr_gazetteer else None),
+        addr_keep_province=not args.no_addr_keep_province,
+        addr_tag=args.addr_tag,
+        public_figure_skip=public_figure_skip,
     )
+    if opt.addr_gazetteer and not Path(opt.addr_gazetteer).exists() and "address" in opt.pdpa_steps:
+        logging.warning("[addr] gazetteer not found: %s (address detection will rely on regex only)", opt.addr_gazetteer)
 
     # ==== GPU discovery (no explicit device CLI needed) ====
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
@@ -1149,7 +1190,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         base_name = args.input.name or "merged"
 
     Good_out   = out_dir / f"GOOD_{base_name}.jsonl"
-    Bad_out = out_dir / f"ฺBAD_{base_name}.jsonl" 
+    Bad_out = out_dir / f"BAD_{base_name}.jsonl"
     mode = "a" if getattr(args, "append_out", False) else "w"
 
     stats_total: Counter = Counter()
@@ -1162,20 +1203,19 @@ def main(argv: Optional[List[str]] = None) -> int:
              Bad_out.open(mode, encoding="utf-8") as fo_Bad:
             for path in iter_files_from_input(args.input, args.pattern):
                 logging.info(f"[INPUT] {path} (single-process)")
-                tmp_dir = out_dir / f"tmp_{path.stem}"
+                tmp_dir = _tmp_dir_for(out_dir, path, opt.debug_first_n)
                 tmp_dir.mkdir(parents=True, exist_ok=True)
+                # single-process ไม่มี resume: ล้าง part เก่าก่อน ไม่งั้นจะถูก merge ซ้ำ
+                CheckpointManager(tmp_dir).clear()
                 part_id = 0
-                for chunk in read_lines_in_chunks(path, args.chunk_size):
-                    res = process_chunk((chunk, part_id, tmp_dir, opt.__dict__.copy()))
+                for chunk in read_lines_in_chunks(path, args.chunk_size, opt.debug_first_n):
+                    res = process_chunk((chunk, part_id, tmp_dir, opt_dict))
                     for k, v in (res or {}).items():
                         stats_total[k] = stats_total.get(k, 0) + int(v)
-                    stream_merge_parts(tmp_dir, fo_Good, fo_Bad)
                     part_id += 1
-        # summary
-        summary = out_dir / "summary.txt"
-        with summary.open("w", encoding="utf-8") as fo:
-            for k, v in sorted(stats_total.items()):
-                fo.write(f"{k}: {v}\n")
+                # merge ครั้งเดียวหลังครบทุก part (เดิม merge ทุกรอบ ทำให้ข้อมูลซ้ำ)
+                stream_merge_parts(tmp_dir, fo_Good, fo_Bad)
+        _write_summary(out_dir, stats_total, opt)
         if stats_total.get("processed", 0) == 0:
             logging.warning("[warn] No records were processed. Check text keys or input format.")
         logging.info(f"[DONE] merged outputs: {Good_out}, {Bad_out}")
@@ -1211,7 +1251,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     _write_summary(out_dir, stats_total, opt)
     if stats_total.get("processed", 0) == 0:
         logging.warning("[warn] No records were processed. Check text keys or input format.")
-    logging.info("[DONE] merged outputs: Good.jsonl, Bad.jsonl")
+    logging.info(f"[DONE] merged outputs: {Good_out}, {Bad_out}")
     return 0
 
 

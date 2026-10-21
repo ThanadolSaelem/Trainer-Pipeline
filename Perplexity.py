@@ -282,6 +282,9 @@ def encode_with_overlap(
         overlap_tokens = 0
     if overlap_tokens >= max_length:
         overlap_tokens = max_length - 1
+    # ต้อง overlap อย่างน้อย 1 โทเค็น ไม่งั้นโทเค็นแรกของทุกหน้าต่างถัดไปไม่มี context และไม่ถูกนับเลย
+    if overlap_tokens < 1 and max_length > 1:
+        overlap_tokens = 1
     step = max(1, max_length - overlap_tokens)
 
     encoded_per_line: List[List[Dict[str, torch.Tensor]]] = []
@@ -323,19 +326,17 @@ def encode_with_overlap(
 
         if total_tokens <= max_length:
             # เคสสั้นพอ: เข็มขัดนิรภัยด้วยการ pad ให้เต็ม window เสมอ
-            enc = tokenizer(
-                rendered,
-                add_special_tokens=True,
-                return_tensors="pt",
-                truncation=True,
-                max_length=max_length,
-                padding="max_length",          # << สำคัญ: pad ให้เท่ากันทุกชิ้น
-                return_token_type_ids=False,
-            )
+            # ไม่ pad ให้เต็ม window: batch_iterator + _pad_to จะ pad ให้เท่ากันเฉพาะใน batch อยู่แล้ว
+            # (การ pad ถึง max_length ทำให้ข้อความสั้นทุกบรรทัดถูกคำนวณยาวเท่า context เช่น 32k โทเค็น)
+            enc = {
+                "input_ids": torch.tensor([token_ids], dtype=torch.long),
+                "attention_mask": torch.ones((1, total_tokens), dtype=torch.long),
+            }
             chunks.append(
                 {
                     "input_ids": enc["input_ids"],
                     "attention_mask": enc["attention_mask"],
+                    "score_from": 0,
                 }
             )
             if verbose:
@@ -353,6 +354,7 @@ def encode_with_overlap(
 
             debug_chunks: List[Tuple[int, int, int]] = []
             start_idx = 0
+            prev_end = 0
             while start_idx < total_tokens:
                 end_idx = min(start_idx + max_length, total_tokens)
                 sub_ids = token_ids[start_idx:end_idx]
@@ -368,9 +370,12 @@ def encode_with_overlap(
                 chunk = {
                     "input_ids": torch.tensor([sub_ids], dtype=torch.long),
                     "attention_mask": torch.tensor([attn], dtype=torch.long),
+                    # โทเค็นช่วง overlap ถูกให้คะแนนไปแล้วในชิ้นก่อนหน้า ใช้เป็น context อย่างเดียว
+                    "score_from": max(0, prev_end - start_idx),
                 }
                 chunks.append(chunk)
                 debug_chunks.append((orig_len, start_idx, end_idx))
+                prev_end = end_idx
 
                 if end_idx >= total_tokens:
                     break
@@ -396,26 +401,15 @@ def encode_with_overlap(
     return encoded_per_line
 
 
-# -------------------- Core: compute PPL per line --------------------
-@torch.no_grad()
-def compute_ppl_per_line(
-    model_name: str,
-    texts: List[str],
-    batch_size: int = 4,
-    max_length: int = 1024,
-    overlap_tokens: Optional[int] = None,
-    overlap_ratio: Optional[float] = 0.25,
-    use_chat_template: Optional[bool] = None,
-    eval_role: str = "assistant",
-    assistant_user_prompt: Optional[str] = None,
-    verbose: bool = False,
-) -> Tuple[List[float], List[int]]:
-    """
-    คืน: (ppl_list, token_counts_list)
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+# -------------------- Model cache --------------------
+_MODEL_CACHE: Dict[str, Tuple[Any, Any]] = {}
 
-    # โหลดโมเดล/โทเค็นไนเซอร์
+
+def load_model_and_tokenizer(model_name: str, verbose: bool = False):
+    """โหลดโมเดลครั้งเดียวต่อ process (โหมด folder เคยโหลดใหม่ทุกไฟล์)"""
+    if model_name in _MODEL_CACHE:
+        return _MODEL_CACHE[model_name]
+
     is_local_path = os.path.exists(model_name) and os.path.isdir(model_name)
     load_kwargs = {"use_fast": True}
     model_kwargs = {
@@ -451,6 +445,57 @@ def compute_ppl_per_line(
             model.resize_token_embeddings(len(tokenizer))
         model.config.pad_token_id = tokenizer.pad_token_id
 
+    _MODEL_CACHE[model_name] = (model, tokenizer)
+    return model, tokenizer
+
+
+_INSTRUCT_HINT = re.compile(
+    r"(^|[-_/.])(instruct|chat|it|sft|alpaca|vicuna)($|[-_/.\d])", re.IGNORECASE
+)
+
+
+def looks_like_instruct_model(model_name: str) -> bool:
+    """เดาว่าเป็นโมเดล instruct จากชื่อ (เดิมเช็ค substring 'it' ซึ่งตรงกับเกือบทุกชื่อ)"""
+    return bool(_INSTRUCT_HINT.search(model_name))
+
+
+def _decode_token(tokenizer, tid: int) -> str:
+    try:
+        t = tokenizer.decode([tid], skip_special_tokens=False)
+        if t and "\ufffd" not in t:
+            return t
+    except Exception:
+        pass
+    try:
+        return str(tokenizer.convert_ids_to_tokens(tid))
+    except Exception:
+        return str(tid)
+
+
+# -------------------- Core: compute PPL per line --------------------
+@torch.no_grad()
+def compute_ppl_per_line(
+    model_name: str,
+    texts: List[str],
+    batch_size: int = 4,
+    max_length: int = 1024,
+    overlap_tokens: Optional[int] = None,
+    overlap_ratio: Optional[float] = 0.25,
+    use_chat_template: Optional[bool] = None,
+    eval_role: str = "assistant",
+    assistant_user_prompt: Optional[str] = None,
+    verbose: bool = False,
+    top_k_tokens: int = 0,
+    details_out: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[List[float], List[int]]:
+    """
+    คืน: (ppl_list, token_counts_list)
+    ถ้าส่ง details_out เข้ามา จะเติมรายละเอียดรายข้อความ (PPL, จำนวนโทเค็น, chars/token,
+    และโทเค็นที่ loss สูงสุด top_k_tokens ตัว) ไว้วิเคราะห์ว่าโมเดลสะดุดตรงไหน
+    """
+    model, tokenizer = load_model_and_tokenizer(model_name, verbose=verbose)
+    device = next(model.parameters()).device
+
     # cap ความยาวต่อชิ้นให้ไม่เกินเพดานจริง
     max_pos_model = getattr(model.config, "max_position_embeddings", None)
     if (max_pos_model is None) or (max_pos_model <= 0):
@@ -464,12 +509,7 @@ def compute_ppl_per_line(
     # ตัดสินใจใช้ chat template?
     template_supported = supports_chat_template(tokenizer)
     if use_chat_template is None:
-        model_name_lower = model_name.lower()
-        likely_instruct = any(
-            k in model_name_lower
-            for k in ["instruct", "chat", "it", "sft", "alpaca", "vicuna", "llama-2-chat", "llama-3-instruct", "gemma"]
-        )
-        will_use_template = template_supported and likely_instruct
+        will_use_template = template_supported and looks_like_instruct_model(model_name)
     else:
         will_use_template = bool(use_chat_template) and template_supported
 
@@ -508,29 +548,32 @@ def compute_ppl_per_line(
     ppl_list: List[float] = []
     tok_list: List[int] = []
     loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (
+        tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
+    )
+
+    def _pad_to(t: torch.Tensor, tgt_len: int, value: int):
+        pad = tgt_len - t.size(1)
+        if pad <= 0:
+            return t
+        return torch.nn.functional.pad(t, (0, pad), value=value)
 
     for line_idx, chunks in enumerate(encoded_per_line):
         if not chunks:
             ppl_list.append(float("inf"))
             tok_list.append(0)
+            if details_out is not None:
+                details_out.append({"index": line_idx, "ppl": None, "tokens": 0,
+                                    "chars": len(clean_texts[line_idx]), "chars_per_token": None,
+                                    "worst_tokens": []})
             continue
 
         sum_nll = 0.0
         sum_tokens = 0
+        worst: List[Tuple[float, int]] = []  # (loss, token_id)
 
         for chunk_batch in batch_iterator(chunks, batch_size):
-            # คำนวณความยาวสูงสุดใน batch แล้วแพดให้เท่ากัน (เผื่อกรณี edge)
             batch_max = max(c["input_ids"].size(1) for c in chunk_batch)
-            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else (
-                tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0
-            )
-
-            def _pad_to(t: torch.Tensor, tgt_len: int, value: int):
-                pad = tgt_len - t.size(1)
-                if pad <= 0:
-                    return t
-                return torch.nn.functional.pad(t, (0, pad), value=value)
-
             input_ids = torch.cat(
                 [_pad_to(c["input_ids"], batch_max, pad_id) for c in chunk_batch], dim=0
             ).to(device)
@@ -540,6 +583,11 @@ def compute_ppl_per_line(
 
             labels = input_ids.clone()
             labels = mask_special_tokens(labels, special_ids)
+            # ไม่ให้คะแนนโทเค็นช่วง overlap ซ้ำ (เดิมนับซ้ำทำให้ PPL เอียงตาม overlap_ratio)
+            for row, c in enumerate(chunk_batch):
+                sf = int(c.get("score_from", 0))
+                if sf > 0:
+                    labels[row, :sf] = -100
 
             with torch.autocast(device_type=("cuda" if torch.cuda.is_available() else "cpu"),
                                 dtype=torch.bfloat16,
@@ -548,7 +596,7 @@ def compute_ppl_per_line(
                 logits = outputs.logits
 
             # shift
-            shift_logits = logits[:, :-1, :].contiguous()
+            shift_logits = logits[:, :-1, :].contiguous().float()
             shift_labels = labels[:, 1:].contiguous()
             shift_mask = ((shift_labels != -100) & (attention_mask[:, 1:] == 1)).to(torch.float32)
 
@@ -563,6 +611,14 @@ def compute_ppl_per_line(
             sum_nll += float(nll_per_seq.sum().item())
             sum_tokens += int(tokens_per_seq.sum().item())
 
+            if top_k_tokens > 0:
+                flat_loss = masked_loss.view(-1)
+                flat_ids = shift_labels.reshape(-1)
+                k = min(top_k_tokens, int(shift_mask.sum().item()))
+                if k > 0:
+                    vals, idxs = torch.topk(flat_loss, k)
+                    worst.extend((float(v), int(flat_ids[i])) for v, i in zip(vals.tolist(), idxs.tolist()))
+
         if sum_tokens > 0:
             ppl = math.exp(sum_nll / sum_tokens)
         else:
@@ -571,10 +627,40 @@ def compute_ppl_per_line(
         ppl_list.append(ppl)
         tok_list.append(sum_tokens)
 
+        if details_out is not None:
+            n_chars = len(clean_texts[line_idx])
+            worst.sort(reverse=True)
+            details_out.append({
+                "index": line_idx,
+                "ppl": ppl if math.isfinite(ppl) else None,
+                "nll_mean": (sum_nll / sum_tokens) if sum_tokens else None,
+                "tokens": sum_tokens,
+                "chars": n_chars,
+                # chars ต่อโทเค็นต่ำ = tokenizer แตกคำเยอะ (fertility สูง) มักเจอกับภาษาไทย/คำเฉพาะทาง
+                "chars_per_token": (n_chars / sum_tokens) if sum_tokens else None,
+                "worst_tokens": [
+                    {"token": _decode_token(tokenizer, tid), "loss": round(l, 4)}
+                    for l, tid in worst[:top_k_tokens]
+                ],
+            })
+
         if verbose and (line_idx + 1) % 10 == 0:
             logger.info(f"Processed {line_idx + 1}/{len(texts)} texts")
 
     return ppl_list, tok_list
+
+
+def micro_ppl(ppls: List[float], tokens: List[int]) -> Optional[float]:
+    """PPL ระดับ token จริง = exp(NLL รวม / token รวม)
+    (เดิมใช้ค่าเฉลี่ย PPL ถ่วงน้ำหนัก ซึ่งไม่เท่ากันและโดนค่าโด่งดึงสูงเกินจริง)"""
+    num = 0.0
+    den = 0
+    for p, t in zip(ppls, tokens):
+        if p is None or not isinstance(p, (int, float)) or not math.isfinite(p) or p <= 0 or t <= 0:
+            continue
+        num += math.log(p) * t
+        den += t
+    return math.exp(num / den) if den > 0 else None
 
 
 # -------------------- High-level: compute_ppl --------------------
@@ -601,6 +687,8 @@ def compute_ppl(
     jsonl_encoding: str = "utf-8",
     max_rows: Optional[int] = None,
     skip_empty: bool = True,
+    top_k_tokens: int = 0,
+    return_details: bool = False,
 ) -> Dict[str, Any]:
     """
     Main entry — รับไฟล์เดี่ยว/ลิสต์ข้อความ → คืน dict ผลลัพธ์
@@ -697,6 +785,7 @@ def compute_ppl(
         logger.info(f"Context length: {context_length}, Overlap: {overlap_tokens} ({eff_ratio:.2%}), Step: {step}")
 
     # คำนวณ PPL
+    details: Optional[List[Dict[str, Any]]] = [] if (return_details or top_k_tokens > 0) else None
     ppl_list, tok_list = compute_ppl_per_line(
         model_name=model_name,
         texts=texts,
@@ -708,6 +797,8 @@ def compute_ppl(
         eval_role=eval_role,
         assistant_user_prompt=assistant_user_prompt,
         verbose=verbose,
+        top_k_tokens=top_k_tokens,
+        details_out=details,
     )
 
     if verbose:
@@ -722,10 +813,8 @@ def compute_ppl(
         ppl_micro = None
     else:
         ppl_macro = sum(valid_ppls) / len(valid_ppls)
-        if total_tokens > 0:
-            weighted_sum = sum(p * t for p, t in zip(ppl_list, tok_list) if not math.isinf(p))
-            ppl_micro = weighted_sum / total_tokens
-        else:
+        ppl_micro = micro_ppl(ppl_list, tok_list)
+        if ppl_micro is None:
             ppl_micro = ppl_macro
 
     result = {
@@ -741,6 +830,8 @@ def compute_ppl(
     if len(texts) > 1:
         result["per_text_ppls"] = ppl_list
         result["per_text_tokens"] = tok_list
+    if details is not None:
+        result["per_text_details"] = details
     return result
 
 
@@ -753,6 +844,7 @@ def process_folder(
     output_json: Optional[str] = None,
     file_extensions: Tuple[str, ...] = (".txt", ".md", ".markdown", ".csv", ".jsonl", ".ndjson"),
     verbose: bool = True,
+    per_text_jsonl: Optional[str] = None,
     **compute_ppl_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -790,8 +882,12 @@ def process_folder(
         logger.info("=" * 60)
 
     file_results: List[Dict[str, Any]] = []
-    total_weighted_ppl = 0.0
+    total_log_ppl = 0.0
     total_tokens = 0
+    per_text_fh = None
+    if per_text_jsonl:
+        Path(per_text_jsonl).parent.mkdir(parents=True, exist_ok=True)
+        per_text_fh = open(per_text_jsonl, "w", encoding="utf-8")
     valid_macro_ppls: List[float] = []
 
     bar = tqdm(
@@ -817,8 +913,12 @@ def process_folder(
                 overlap_ratio=overlap_ratio,
                 is_file=True,
                 verbose=verbose,
+                return_details=per_text_fh is not None,
                 **compute_ppl_kwargs,
             )
+            if per_text_fh is not None:
+                for d in result.get("per_text_details", []) or []:
+                    per_text_fh.write(json.dumps({"file": str(rel), **d}, ensure_ascii=False) + "\n")
 
             ppl_micro = result.get("PPL_micro")
             ppl_macro = result.get("PPL_macro")
@@ -836,7 +936,7 @@ def process_folder(
             })
 
             if isinstance(ppl_micro, (int, float)) and math.isfinite(ppl_micro) and tokens > 0:
-                total_weighted_ppl += ppl_micro * tokens
+                total_log_ppl += math.log(ppl_micro) * tokens
                 total_tokens += tokens
 
             if isinstance(ppl_macro, (int, float)) and math.isfinite(ppl_macro):
@@ -868,7 +968,9 @@ def process_folder(
             if not verbose:
                 bar.set_postfix({"error": str(e)[:40] + "..."})
 
-    ppl_micro_folder = (total_weighted_ppl / total_tokens) if total_tokens > 0 else None
+    if per_text_fh is not None:
+        per_text_fh.close()
+    ppl_micro_folder = math.exp(total_log_ppl / total_tokens) if total_tokens > 0 else None
     ppl_macro_folder = (sum(valid_macro_ppls) / len(valid_macro_ppls)) if valid_macro_ppls else None
     ppl_dataset_weighted = ppl_micro_folder
     harmonic_mean = safe_harmonic_mean(valid_macro_ppls)
@@ -952,6 +1054,9 @@ if __name__ == "__main__":
     parser.add_argument("--jsonl_encoding", type=str, default="utf-8")
     parser.add_argument("--max_rows", type=int, default=None)
     parser.add_argument("--skip_empty", type=str, default="true", choices=["true", "false"])
+    parser.add_argument("--top_k_tokens", type=int, default=0, help="เก็บโทเค็นที่ loss สูงสุด k ตัวต่อข้อความ")
+    parser.add_argument("--per_text_jsonl", type=str, default=None, help="เขียนผลรายข้อความลง JSONL (PPL, chars/token, worst tokens)")
+    parser.add_argument("--output_json", type=str, default=None, help="บันทึกผลสรุปเป็น JSON")
 
     # folder mode
     p_folder = sub.add_parser("folder", help="Process an entire folder")
@@ -971,6 +1076,8 @@ if __name__ == "__main__":
     p_folder.add_argument("--jsonl_encoding", type=str, default="utf-8")
     p_folder.add_argument("--max_rows", type=int, default=None)
     p_folder.add_argument("--skip_empty", type=str, default="true", choices=["true", "false"])
+    p_folder.add_argument("--top_k_tokens", type=int, default=0, help="เก็บโทเค็นที่ loss สูงสุด k ตัวต่อข้อความ")
+    p_folder.add_argument("--per_text_jsonl", type=str, default=None, help="เขียนผลรายข้อความลง JSONL (PPL, chars/token, worst tokens)")
 
     args = parser.parse_args()
 
@@ -994,6 +1101,8 @@ if __name__ == "__main__":
             jsonl_encoding=args.jsonl_encoding,
             max_rows=args.max_rows,
             skip_empty=_str2bool(args.skip_empty),
+            top_k_tokens=args.top_k_tokens,
+            per_text_jsonl=args.per_text_jsonl,
         )
         ds = results.get("PPL_dataset")
         logger.info(f"\n✅ Done! PPL_dataset = {ds:.4f}" if isinstance(ds, (int, float)) else "\n✅ Done! PPL_dataset = N/A")
@@ -1033,7 +1142,19 @@ if __name__ == "__main__":
             jsonl_encoding=args.jsonl_encoding,
             max_rows=args.max_rows,
             skip_empty=_str2bool(args.skip_empty),
+            top_k_tokens=args.top_k_tokens,
+            return_details=bool(args.per_text_jsonl),
         )
+        if args.per_text_jsonl:
+            Path(args.per_text_jsonl).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.per_text_jsonl, "w", encoding="utf-8") as f:
+                for d in res.get("per_text_details", []) or []:
+                    f.write(json.dumps(d, ensure_ascii=False) + "\n")
+        if args.output_json:
+            Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
+            summary = {k: v for k, v in res.items() if k != "per_text_details"}
+            with open(args.output_json, "w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
         pm = res.get("PPL_macro")
         pmicro = res.get("PPL_micro")
         logger.info("\n=== RESULT ===")

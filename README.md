@@ -29,8 +29,8 @@ https://huggingface.co/loolootech/no-name-ner-th
 - **อินพุต**: โฟลเดอร์ที่มีไฟล์ `*.jsonl` (กำหนดลายแพทเทิร์นด้วย `--pattern`)
 - **ฟิลด์ข้อความ**: ถ้าไม่ระบุ `--text-keys` ระบบจะพยายามเดา key ทั่วไป เช่น `text`, `content`, `body`, `ocr_text` ฯลฯ; หรือใช้ `--combine-keys` เพื่อรวมหลายคีย์เป็นหนึ่งเดียว
 - **เอาต์พุต**: โฟลเดอร์ปลายทาง `--out` จะมีผลลัพธ์ชุดใหญ่ เช่น
-  - `legal.jsonl` / `illegal.jsonl` (ข้อมูลที่ผ่าน/ไม่ผ่านเงื่อนไขเบื้องต้น)
-  - ไฟล์ย่อย/ไฟล์ส่วน และ `summary.txt` (ตัวเลขสรุปการประมวลผล)
+  - `GOOD_<ชื่ออินพุต>.jsonl` / `BAD_<ชื่ออินพุต>.jsonl` (ข้อมูลที่ fastText ตัดสินว่าผ่าน/ไม่ผ่าน)
+  - `summary.txt` และ `summary.json` (ตัวเลขสรุปการประมวลผล + ตัวเลือกที่ใช้)
 - มีระบบ **checkpoint/resume** ทำงานอัตโนมัติ สามารถสั่ง `--no-resume` หรือ `--clear-ckpt` เพื่อเริ่มใหม่
 
 ---
@@ -135,26 +135,28 @@ python Pipeline_clean.py -i data -o runs/exp4 --append-out
 - `--save-every`: บันทึกผลทุก ๆ N ชิ้นงาน (ช่วยให้ resume ได้ละเอียดขึ้น)
 - `--resume` / `--no-resume`: เปิด/ปิดโหมดทำต่อจาก checkpoint (ค่าเริ่มต้นคือเปิด)
 - `--clear-ckpt`: ลบ checkpoint ก่อนเริ่ม
-- `--dry-run`: โหมดลองรัน (ไม่เขียนผลลัพธ์จริง)
-- `--debug-first-n`: ประมวลผลเฉพาะ N แถวแรก (ดีมากสำหรับลองของ)
-- `--debug-show-diff`: แสดง diff ก่อน-หลังทำความสะอาด
+- `--single-process`: รันแบบไม่ใช้ multiprocessing (ไม่มี resume)
+- `--debug-first-n`: ประมวลผลเฉพาะ N แถวแรกของแต่ละไฟล์ (ใช้โฟลเดอร์ชั่วคราวแยก ไม่กระทบ checkpoint ของรอบจริง)
+- `--debug-show-diff`: log ข้อความก่อน-หลังทำความสะอาด (N แถวแรก หรือ 10 แถวแรกของแต่ละชิ้นงาน)
+- `--self-test`: ทดสอบ NER และตัวแก้สระลอยกับประโยคตัวอย่าง
+- `--doctor`: ตรวจ environment (bs4, NER, CUDA)
 
 ### การเลือกคีย์ข้อความ
 - `--text-keys "k1,k2,..."`: ระบุคีย์ที่เป็นข้อความชัดเจน
 - `--combine-keys "k1,k2,..."`: รวมข้อความจากหลายคีย์เข้าด้วยกัน
 
 ### ขั้นตอน sanitize/clean เบื้องต้น
-- `--clean-steps`: รายการขั้นตอน เช่น `html,bbcode,emoticon,links,social`
+- `--clean-steps`: รายการขั้นตอน เช่น `html,bbcode,emoji,emoticon,links,social` (ค่าเริ่มต้น `html,emoji,emoticon`; ชื่อที่ไม่รู้จักจะมีคำเตือน)
   - รองรับชื่อเก่าแนว `remove_*` เพื่อความเข้ากันได้ย้อนหลัง เช่น `remove_html`, `remove_emails`
 
 ### PDPA
 - `--pdpa-policy`: `skip | mask | anonymize | drop`  
-- `--pdpa-steps`: เลือกสิ่งที่จะจัดการ เช่น `name,email,phone,links,card,account,address,id_card`
+- `--pdpa-steps`: เลือกสิ่งที่จะจัดการ เช่น `name,email,phone,links,card,account,address,id_card` (`id_card` ใช้ได้ทั้ง mask/anonymize/drop)
 - ตัวเลือกเสริม:
   - `--keep-last`: จำนวนเลขท้ายที่คงไว้ในโหมด mask (เช่น บัตร/บัญชี)
   - `--card-mode`, `--account-mode`: โหมดการแทนค่า/สุ่มของบัตรและบัญชี
   - `--pdpa-salt`: seed noise สำหรับการทำ anonymize ให้คงที่
-  - `--addr-gazetteer`: ไฟล์ gazetteer ไทยสำหรับตรวจจับ/แทนที่ที่อยู่
+  - `--addr-gazetteer`: ไฟล์ gazetteer ไทยสำหรับตรวจจับ/แทนที่ที่อยู่ (ไม่ได้แนบมาใน repo ต้องเตรียมเอง ถ้าไม่มีไฟล์จะเตือนและใช้ regex อย่างเดียว)
   - `--no-addr-keep-province`: อนุญาตให้สุ่มจังหวัดใหม่เมื่อ anonymize
   - `--addr-tag`: แท็กสำหรับ mask ที่อยู่ (ค่าเริ่มต้น `[ADDRESS]`)
 
@@ -168,19 +170,19 @@ python Pipeline_clean.py -i data -o runs/exp4 --append-out
 
 ### การตรวจจับสคริปต์ผสม + ตัวช่วยแก้เครื่องหมายไทย
 - `--detect-mixed-script`: ตรวจจับอักขระไทยติดกับ Latin/ญี่ปุ่น/จีน
-- `--mixed-policy`: `skip | tag` (ถ้า `tag` ระบบจะจดธงไว้ใน `--flags-key`)
+- `--mixed-policy`: `skip | tag` (ถ้า `tag` ระบบจะจดธงไว้ใน `--flags-key`; ทั้งสองแบบนับจำนวนไว้ใน summary)
 - `--thai-mark-fix`: เปิดการแก้ **สระลอย**, ดึงสระกลับ, ลบ/แทนที่สระที่ลอย, และจัดกลุ่มเครื่องหมายซ้ำ
 - `--floating-policy`: วิธีจัดการสระที่ลอย `drop | mask | keep`
-- `--pull-back-gap`: รูปแบบช่องว่างที่จะดึงกลับ `any | tight`
+- `--pull-back-gap`: รูปแบบช่องว่างที่จะดึงกลับ `any | tight` (สงวนไว้ ยังไม่มีผลกับการประมวลผล)
 - `--normalize`: ปรับ normalization `NFC | NFKC | none`
 - `--flags-key`: ชื่อคีย์ในเอาต์พุตสำหรับเก็บธง เช่น `"__flags"`
 
 ### ตัวกรอง fastText (ถ้ามี)
-- `--fasttext-model PATH`: ใช้งานโมเดล fastText เพื่อช่วยแยก legal/illegal
+- `--fasttext-model PATH`: ใช้งานโมเดล fastText เพื่อช่วยแยก GOOD/BAD (ใช้ tokenizer จาก `THAI_NER_PATH` ตัดคำก่อนจัดหมวด; เกณฑ์ปรับได้ด้วย env `FT_POS_THRESHOLD` ค่าเริ่มต้น 0.95)
 - `--no-fasttext`: ปิดการใช้ fastText
 
 ### รายชื่อบุคคลสาธารณะ (ถ้ามี)
-- `--public-figure-files`: ไฟล์รายชื่อบุคคลสาธารณะเพื่อช่วยลด false positive
+- `--public-figure-files`: ไฟล์รายชื่อบุคคลสาธารณะเพื่อช่วยลด false positive (ไม่ระบุ = ใช้ไฟล์ใน `corpus/`)
 - `--no-public-figure-skip`: ปิดการข้ามชื่อที่อยู่ในรายชื่อสาธารณะ
 
 ---
@@ -216,8 +218,8 @@ python Pipeline_clean.py -i data -o runs/drop \
 ---
 
 ## โครงสร้างผลลัพธ์โดยย่อ
-- `legal.jsonl` / `illegal.jsonl` — บรรทัดละ 1 เร็กคอร์ด (JSON) พร้อมข้อความที่ถูกทำความสะอาด
-- `summary.txt` — ตัวเลขสรุป (จำนวนเร็กคอร์ด, สัดส่วน, ฯลฯ)
+- `GOOD_<ชื่ออินพุต>.jsonl` / `BAD_<ชื่ออินพุต>.jsonl` — บรรทัดละ 1 เร็กคอร์ด (JSON) พร้อมข้อความที่ถูกทำความสะอาด
+- `summary.txt` / `summary.json` — ตัวเลขสรุป (processed, Good, Bad, errors_json, skipped_no_text, mixed_adjacent) และตัวเลือกที่ใช้
 - อาจมีโฟลเดอร์ชิ้นงานชั่วคราว เพื่อรองรับการ resume/merge อัตโนมัติ
 
 ---
@@ -267,6 +269,9 @@ python Pipeline_clean.py -i data -o runs/drop \
 - --max_rows            จำกัดจำนวนแถวสูงสุดที่อ่านจาก CSV/JSONL
 - --skip_empty          ข้ามบรรทัดว่าง (true/false)
 - --verbose             โชว์ log รายละเอียด
+- --top_k_tokens        เก็บโทเค็นที่ loss สูงสุด k ตัวต่อข้อความ (ดูว่าโมเดลสะดุดคำไหน)
+- --per_text_jsonl      เขียนผลรายข้อความลง JSONL: ppl, tokens, chars_per_token, worst_tokens
+- --output_json         (โหมดไฟล์เดี่ยว) บันทึกผลสรุปเป็น JSON
 ---
 
 ## ตัวอย่างการใช้งาน
@@ -338,6 +343,9 @@ Bash:
 
 ## ผลลัพธ์และไฟล์สรุป
 - โหมดไฟล์เดี่ยว/ข้อความเดี่ยว: จะแสดง PPL_macro, PPL_micro, tokens ใน log
+- PPL_micro = exp(NLL รวม / จำนวนโทเค็นรวม) คือ PPL ระดับโทเค็นจริง; PPL_macro = ค่าเฉลี่ย PPL รายข้อความ
+- โทเค็นในช่วง overlap ใช้เป็น context เท่านั้น ไม่ถูกนับ loss ซ้ำ
+- `chars_per_token` ต่ำ หมายถึง tokenizer แตกข้อความเป็นชิ้นเล็กมาก (fertility สูง) ใช้แยกปัญหา vocab ออกจากปัญหาเนื้อหา
 - โหมดโฟลเดอร์: ถ้าระบุ --output_json จะสร้างไฟล์ JSON สรุปเดียวที่มีคีย์ "files" เก็บผลรายไฟล์
   ตัวอย่างส่วน "files" ภายใน ppl_summary.json:
   ```bash
