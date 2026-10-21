@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# panel workspace (machine-specific settings and run outputs)
+panel/panel.yaml
+panel/runs/
+
+# downloaded data and models
+evaluation/data/
+evaluation/results/
+evaluation/logs/
+data-pipeline/model/NERmodel/*
+!data-pipeline/model/NERmodel/place_model_files_here
+data-pipeline/model/*.bin
+
+.DS_Store
