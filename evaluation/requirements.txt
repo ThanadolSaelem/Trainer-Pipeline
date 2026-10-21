@@ -1,0 +1,11 @@
+pandas 
+numpy
+datasets>=3.3.2
+transformers 
+accelerate 
+tqdm
+gdown
+huggingface_hub
+numpy
+torch
+openai

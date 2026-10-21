@@ -1,0 +1,10 @@
+refactor.ipynb
+data/
+logs/
+prompt_process1.py
+results_beta/
+results/
+*/__pycache__/
+*.pyc
+slurm-*.out
+
