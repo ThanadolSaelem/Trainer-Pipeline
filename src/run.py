@@ -11,7 +11,7 @@ def main(args):
     if args.openai:
         model_obj = OpenAIModel(args.openai, args.model_path)
     elif args.vllm:
-        model_obj = VLLMModel(args.vllm, args.model_path)
+        model_obj = VLLMModel(args.vllm, args.model_path, api_key=args.api_key)
         if not(model_obj.test_connection()):
             raise ConnectionError(
         f"Unable to establish connection to {model_obj.__class__.__name__} "
@@ -77,7 +77,8 @@ def main(args):
                     current_time=current_time,
                     instuction="ต่อไปนี้เป็นข้อสอบปรนัยจงเลือกคำตอบที่ถูกต้องที่สุด",
                     debug=args.debug,
-                    thinking= args.thinking_mode
+                    thinking= args.thinking_mode,
+                    do_sample=args.do_sample,
                 )
         if dataset_name != "mmlu":
             
@@ -128,6 +129,7 @@ if __name__ == "__main__":
     )
     
     parser.add_argument("--debug", action="store_true", help="Run in debug mode")
+    parser.add_argument("--do-sample", action="store_true", help="ใช้ sampling ตอน generate (โหมด it) ค่าเริ่มต้นเป็น greedy เพื่อให้ผลซ้ำได้")
     
     parser.add_argument("-s", "--seed", type=int, default=47, help="Random seed")
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for evaluation")

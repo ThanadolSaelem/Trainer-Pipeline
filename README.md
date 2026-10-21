@@ -16,7 +16,7 @@ For chat/instruction-following models with conversation formats.
 ### 2. Pretrain Mode (`--mode pt`)
 For base/pretrained models without instruction formatting.
 > [!NOTE]
-> Pretrain mode (`pt`) evaluation typically requires a batch size of 1 for local Hugging Face models.
+> Pretrain mode (`pt`) now uses left padding with proper attention masks and position ids, so batch sizes above 1 are supported for local Hugging Face models.
 
 ## Thinking Mode Options (`-t` or `--thinking-mode`)
 
@@ -137,6 +137,7 @@ Launches separate SLURM jobs concurrently for all 9 supported datasets in pretra
 - `--batch-size`: Batch size for evaluation (default: `1`)
 - `--max-seq-len`: Maximum sequence length for token generation (default: `8192`)
 - `--seed`: Random seed for reproducibility (default: `47`)
+- `--do-sample`: Use sampling when generating in `it` mode. Default is greedy decoding (API models get `temperature=0`) so repeated runs give the same score. Turn this on for thinking models that loop under greedy decoding, or for API models that reject `temperature=0`.
 
 ### Output Configuration
 - `--save-result-dir`: Directory where outputs will be saved (default: `./results`)
@@ -186,7 +187,9 @@ results/
 ---
 
 ## Notes & Limitations
-- **Batch Size Limitations**: 
-  - Pretrain mode (`pt`) only supports batch size 1 for local Hugging Face models.
+- **Batch Size**: 
+  - Pretrain mode (`pt`) supports batch sizes above 1 for local Hugging Face models (left padding).
   - API models (OpenAI, vLLM) support higher batch sizes for faster concurrent API calls.
+- **Answer extraction (`it` mode)**: the last `\boxed{}` after any `</think>` block is used, normalized to the leading choice label (e.g. `A. text` becomes `A`).
+- **Thinking with vLLM**: `-t True/False` is forwarded as `chat_template_kwargs.enable_thinking`.
 - **Connection Diagnostics**: The framework automatically verifies connection health for vLLM servers before commencing evaluation.

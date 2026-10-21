@@ -7,6 +7,22 @@ from concurrent.futures import ThreadPoolExecutor
 from .prompt_process.formatters import FORMATTERS
 from typing import List
 import requests
+def _normalize_thinking(thinking_mode):
+    """แปลงค่า thinking ให้เป็นรูปแบบเดียว: "True" | "False" | "no_chat_template" | None"""
+    if thinking_mode is True:
+        return "True"
+    if thinking_mode is False:
+        return "False"
+    if isinstance(thinking_mode, str):
+        if thinking_mode.lower() == "true":
+            return "True"
+        if thinking_mode.lower() == "false":
+            return "False"
+        if thinking_mode == "no_chat_template":
+            return thinking_mode
+    return None
+
+
 class BaseModel(ABC):
     @abstractmethod
     def load_model(self):
@@ -35,45 +51,64 @@ class HFModel(BaseModel):
             trust_remote_code=True,
             dtype=torch.bfloat16
         ).eval()
-        self.model.generation_config = GenerationConfig.from_pretrained(
-            self.checkpoint_path,
-            pad_token_id=self.tokenizer.pad_token_id,
-            trust_remote_code=True
-        )
+        try:
+            self.model.generation_config = GenerationConfig.from_pretrained(
+                self.checkpoint_path,
+                pad_token_id=self.tokenizer.pad_token_id,
+                trust_remote_code=True
+            )
+        except OSError:
+            pass  # บาง checkpoint ไม่มี generation_config.json
+        # decoder-only ต้อง pad ด้านซ้าย ไม่งั้นตำแหน่งสุดท้าย (logits[:, -1]) และการ generate
+        # ของตัวอย่างที่สั้นกว่าใน batch จะไปตกที่ pad token
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            self.model.config.pad_token_id = self.tokenizer.eos_token_id
     
     def generate(self, *args, **kwargs):
         return self.model.generate(*args, **kwargs)
 
     def get_logits(self, inputs: List[str], max_seq_len: int = 8192):
-        input_ids = self.tokenizer(inputs, padding='longest', return_tensors='pt')["input_ids"]
-        input_ids = input_ids.to(self.model.device)
+        """คืน logits ดิบของโทเค็นถัดไป (ยังไม่ softmax) ขนาด [batch, vocab]
+
+        ใช้ left padding + attention_mask จาก tokenizer + position_ids ที่ไม่นับ pad
+        จึงใช้ batch size มากกว่า 1 ได้ในโหมด pt
+        """
+        enc = self.tokenizer(inputs, padding='longest', return_tensors='pt')
+        input_ids = enc["input_ids"]
+        attention_mask = enc["attention_mask"]
 
         if input_ids.shape[1] > max_seq_len:
             input_ids = input_ids[:, -max_seq_len:]
+            attention_mask = attention_mask[:, -max_seq_len:]
 
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        outputs = self.model(input_ids, attention_mask=attention_mask)
-        logits = outputs["logits"][:, -1, :]
-        log_probs = torch.nn.functional.softmax(logits, dim=-1)
-        return log_probs, {"tokens": {"input_ids": input_ids}}
-    def format_instructions(self, prompt: str, thinking_mode=True) -> str:
+        input_ids = input_ids.to(self.model.device)
+        attention_mask = attention_mask.to(self.model.device)
+        position_ids = (attention_mask.long().cumsum(-1) - 1).clamp(min=0)
+        try:
+            outputs = self.model(input_ids, attention_mask=attention_mask, position_ids=position_ids)
+        except TypeError:
+            outputs = self.model(input_ids, attention_mask=attention_mask)
+        logits = outputs["logits"][:, -1, :].float()
+        return logits, {"tokens": {"input_ids": input_ids}}
+
+    def format_instructions(self, prompt: str, thinking_mode=None) -> str:
+        """thinking_mode: "True" | "False" | "no_chat_template" | None (รับ bool ได้ด้วย)
+
+        เดิม evaluator ส่ง bool มาแต่ฟังก์ชันเช็คเป็น string ทำให้ตกไป branch ที่ไม่มี
+        generation prompt และ thinking flag ไม่มีผล
+        """
+        mode = _normalize_thinking(thinking_mode)
         messages = [
             {"role": "user", "content": f"{prompt} \nช่วยตอบลงในช่อง \\boxed{{}} เท่านั้นหากตอบถูกแต่ไม่อยู่ในรูปแบบนี้จะไม่ถูกนับเป็นคำตอบที่ถูกต้อง"},
         ]
-        if thinking_mode == "no_chat_template":
-            text = messages[0]['content'] + "The answer is: "
-        elif thinking_mode in ["True", "False"]:
-            text = self.tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=bool(thinking_mode))
-        else:
-            text = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=False)
-        return text
+        if mode == "no_chat_template":
+            return messages[0]['content'] + "The answer is: "
+        kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if mode in ("True", "False"):
+            kwargs["enable_thinking"] = (mode == "True")
+        return self.tokenizer.apply_chat_template(messages, **kwargs)
 
 
 class OpenAIModel(BaseModel):
@@ -83,12 +118,18 @@ class OpenAIModel(BaseModel):
         openai.api_key = self.api_key
 
     def generate_prompt(self, prompt, **kwargs):
-        response = openai.chat.completions.create(
-            model=self.model_name,
-            messages=prompt,
-            **kwargs
-        )
-        return response.choices[0].message.content
+        if isinstance(prompt, str):
+            prompt = [{"role": "user", "content": prompt}]
+        try:
+            response = openai.chat.completions.create(
+                model=self.model_name,
+                messages=prompt,
+                **kwargs
+            )
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            print(f"OpenAI request failed: {e}")
+            return ""
 
     def generate(self, prompts, **kwargs):
         if isinstance(prompts, str):
@@ -98,7 +139,8 @@ class OpenAIModel(BaseModel):
             results = list(executor.map(lambda p: self.generate_prompt(p, **kwargs), prompts))
         return results
 
-    def format_instructions(self, prompt: str, choices: List[str], thinking_mode=True):
+    def format_instructions(self, prompt: str, choices: List[str] = None, thinking_mode=None):
+        # choices เป็น optional: evaluator ไม่ได้ส่งมา (เดิมทำให้โหมด it กับ API error ทันที)
         messages = [
             {"role": "user", "content": f"{prompt} \nช่วยตอบลงในช่อง \\boxed{{}} เท่านั้นหากตอบถูกแต่ไม่อยู่ในรูปแบบนี้จะไม่ถูกนับเป็นคำตอบที่ถูกต้อง"},
         ]
@@ -221,14 +263,14 @@ class VLLMModel(BaseModel):
             print(f"API request failed: {e}")
             return None
     
-    def format_instructions(self, prompt: str, choices: List[str], thinking_mode=True):
+    def format_instructions(self, prompt: str, choices: List[str] = None, thinking_mode=None):
         """
         Format instructions for multiple choice questions
         
         Args:
             prompt: Question prompt
-            choices: List of answer choices
-            thinking_mode: Whether to enable thinking mode (not used in vLLM API)
+            choices: List of answer choices (ไม่ได้ใช้ คงไว้เพื่อความเข้ากันได้)
+            thinking_mode: ส่งต่อไปเป็น chat_template_kwargs.enable_thinking ตอน generate
         """
         messages = [
             {"role": "user", "content": f"{prompt} \nช่วยตอบลงในช่อง \\boxed{{}} เท่านั้นหากตอบถูกแต่ไม่อยู่ในรูปแบบนี้จะไม่ถูกนับเป็นคำตอบที่ถูกต้อง"},
@@ -255,9 +297,10 @@ class VLLMModel(BaseModel):
         """
         Test connection to vLLM API server
         """
+        # generate_prompt คืน None เมื่อเรียกไม่สำเร็จ (เดิมคืน True เสมอเพราะไม่ได้เช็คค่านี้)
         try:
             test_response = self.generate_prompt("Hello", max_tokens=10)
-            return True
+            return test_response is not None
         except Exception as e:
             print(f"Connection test failed: {e}")
             return False

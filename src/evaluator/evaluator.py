@@ -76,10 +76,10 @@ class Evaluator:
             ).unsqueeze(0).to(self.model_obj.model.device)
 
             
+            # get_logits คืน logits ดิบ: softmax ครั้งเดียวเฉพาะโทเค็นตัวเลือก
+            # (เดิม softmax ทั้ง vocab แล้ว softmax ซ้ำ ทำให้ prob_* ที่บันทึกเพี้ยน)
             logits, input_info = self.model_obj.get_logits(full_prompt_list, max_seq_len)
-            softval = logits.gather(1, choice_ids.expand(logits.size(0), -1)).softmax(1)
-            if softval.dtype in {torch.bfloat16, torch.float16}:
-                softval = softval.to(dtype=torch.float32)
+            softval = logits.gather(1, choice_ids.expand(logits.size(0), -1)).float().softmax(1)
             probs = softval.detach().cpu().numpy()
 
             for i in range(len(probs)):
@@ -127,7 +127,8 @@ class Evaluator:
         current_time: str=None,
         instuction: str="ต่อไปนี้เป็นข้อสอบปรนัยจงเลือกคำตอบที่ถูกต้องที่สุด",
         debug: bool = False,
-        thinking: bool = True,
+        thinking=None,
+        do_sample: bool = False,
         **kwargs,
     ):
 
@@ -151,9 +152,10 @@ class Evaluator:
                     is_instruction=True,
                 )
                 
+                # ส่งค่า thinking เดิม ("True"/"False"/"no_chat_template"/None) ไปตรง ๆ
                 chat_template_apply = self.model_obj.format_instructions(
                     prompt,
-                    thinking_mode=True if thinking=="True" else False 
+                    thinking_mode=thinking,
                 )
                 
                 full_prompt_list.append(chat_template_apply)
@@ -162,8 +164,9 @@ class Evaluator:
 
             if isinstance(self.model_obj, HFModel):
                 model_inputs = self.model_obj.tokenizer(full_prompt_list, return_tensors="pt", padding=True, truncation=True).to(self.model_obj.model.device)
+                # ค่าเริ่มต้น greedy เพื่อให้ผลซ้ำได้ (เปิด sampling ได้ด้วย --do-sample)
                 generation_config = GenerationConfig(
-                        do_sample=True,
+                        do_sample=do_sample,
                         max_new_tokens=8192 if thinking == "True" else 1024,
                     )
                 if thinking == "no_chat_template":
@@ -183,7 +186,8 @@ class Evaluator:
                         use_cache=True,
                     )
                 for i, input_ids in enumerate(model_inputs.input_ids):
-                    output_ids = generated_ids[i][len(input_ids)-1:].tolist()
+                    # left padding: prompt ทุกแถวยาวเท่ากัน ตัดตามความยาว prompt พอดี
+                    output_ids = generated_ids[i][len(input_ids):].tolist()
                     decoded_output = self.model_obj.tokenizer.decode(output_ids, skip_special_tokens=True)
                     processor = PostProcessor(decoded_output)
                     thinks.append(processor.extract_think())
@@ -192,9 +196,13 @@ class Evaluator:
                     result.append(pred)
                     score.append(1 if pred == answer_list[i] else 0)
             elif isinstance(self.model_obj, (OpenAIModel, VLLMModel)):
+                    # use_cache ไม่ใช่พารามิเตอร์ของ chat completions API (OpenAI SDK จะ TypeError)
+                    api_kwargs = {} if do_sample else {"temperature": 0}
+                    if isinstance(self.model_obj, VLLMModel) and thinking in ("True", "False"):
+                        api_kwargs["chat_template_kwargs"] = {"enable_thinking": thinking == "True"}
                     outputs = self.model_obj.generate(
                         full_prompt_list,
-                        use_cache=True,
+                        **api_kwargs,
                     )
                     for i, decoded_output in enumerate(outputs):
                         processor = PostProcessor(decoded_output)
